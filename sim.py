@@ -77,7 +77,7 @@ PIPELINES = {
         "micro_fusion_fe": True,
         "mov_elim_gpr": True,
         "mov_elim_vec": True,
-        "self_mov_elim": False,     # PMU: Zen 4 does not eliminate `mov rdx, rdx` (rand_00_scalar: 4.00 cyc)
+        "self_mov_elim": True,      # PMU: Zen 4 eliminates `mov rdx, rdx` (probe_self_mov_dep: 3.00 cyc)
         "split_sched": True,
         "branch_ends_fetch": False, # PMU: Zen 4 op-cache streams across back-edges (2.34, 2.51, 3.17)
         "use_measured_tp_occ": True,
