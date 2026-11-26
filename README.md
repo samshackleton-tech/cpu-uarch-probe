@@ -99,5 +99,6 @@ upstream projects (`uops.info`, `RRZE-HPC/OSACA`, and `llvm/llvm-project`).
 
 ## License
 
-Quad-licensed under your choice of **MIT**, **Apache-2.0**, **TGPPL-1.0**, or
-**BOSL-1.0** (see `LICENSE`).
+Quad-licensed under your choice of **MIT** (`LICENSE-MIT`), **Apache-2.0**
+(`LICENSE-APACHE`), **TGPPL-1.0** (`LICENSE-TGPPL`), or **BOSL-1.0**
+(`LICENSE-BOSL.txt`); see `LICENSE` for details and third-party data attribution.
