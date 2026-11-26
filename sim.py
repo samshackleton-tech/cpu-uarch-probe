@@ -13,7 +13,7 @@ Unlike coarse static lower bounds or LLVM scheduling-table throughput sums, this
 
 Strictly advisory — never imported or relied on by `proof-core/odeverify` or `lang/odec.py`.
 """
-import collections, json, math, os, sys
+import collections, heapq, json, math, os, sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -32,7 +32,8 @@ PIPELINES = {
         "int_dispatch_width": 6,    # Zen 5 integer execution dispatch width (calibrated via PMU: 14 ALU -> 3.01 cyc, 14 mov -> 2.01 cyc)
         "fp_dispatch_width": 6,     # Zen 5 widened FP/Vec dispatch (6/cyc; calibrated via PMU)
         "fp_sched_size": 96,
-        "int_sched_size": 144,
+        "int_sched_size": 96,
+        "agu_sched_size": 72,       # Zen 5 has separate ALU & AGU schedulers
         "alu_ports": ["ALU0", "ALU1", "ALU2", "ALU3", "ALU4", "ALU5"],
         "branch_ports": ["ALU0", "ALU1", "ALU2"],
         "load_ports": ["AGU0", "AGU1", "AGU2", "AGU3"],  # Zen 5 has 4 L1D load AGUs (PMU: 8 loads = 2.20 cyc)
@@ -65,7 +66,8 @@ PIPELINES = {
         "int_dispatch_width": 6,
         "fp_dispatch_width": 6,     # PMU: Zen 4 dispatches 6 128-bit SSE ops/cyc (rand_02_sse=3.51, rand_08_sse=5.61)
         "fp_sched_size": 64,
-        "int_sched_size": 96,
+        "int_sched_size": 96,       # Zen 4: 4x24 ALU + separate 3x24=72 AGU scheduler
+        "agu_sched_size": 72,
         "alu_ports": ["ALU0", "ALU1", "ALU2", "ALU3"],
         "branch_ports": ["ALU0", "ALU1"],
         "load_ports": ["AGU0", "AGU1", "AGU2"],
@@ -77,7 +79,7 @@ PIPELINES = {
         "micro_fusion_fe": True,
         "mov_elim_gpr": True,
         "mov_elim_vec": True,
-        "self_mov_elim": True,      # PMU: Zen 4 eliminates `mov rdx, rdx` (probe_self_mov_dep: 3.00 cyc)
+        "self_mov_elim": False,     # PMU: Zen 4 does not eliminate `mov rdx, rdx` (rand_00_scalar: 4.00 cyc)
         "split_sched": True,
         "branch_ends_fetch": False, # PMU: Zen 4 op-cache streams across back-edges (2.34, 2.51, 3.17)
         "use_measured_tp_occ": True,
@@ -95,7 +97,8 @@ PIPELINES = {
         "int_dispatch_width": 6,
         "fp_dispatch_width": 6,
         "fp_sched_size": 64,
-        "int_sched_size": 96,
+        "int_sched_size": 96,       # Zen 3: 4x24 ALU + separate 48-entry AGU scheduler
+        "agu_sched_size": 48,
         "alu_ports": ["ALU0", "ALU1", "ALU2", "ALU3"],
         "branch_ports": ["ALU0", "ALU1"],
         "load_ports": ["AGU0", "AGU1", "AGU2"],
@@ -240,7 +243,7 @@ PIPELINES = {
 _X86_COND_JCC = {"je", "jne", "jae", "jb", "ja", "jbe"}
 _X86_FUSE_CMP = {"cmp64_rr", "cmp64_ri", "cmp64_rm", "test64_same", "test32_same"}
 _X86_FUSE_ALU = {"add64_rr", "add64_ri", "sub64_rr", "sub64_ri", "and64_rr", "and64_ri", "dec64", "dec32", "dec8_al"}
-_ARM_COND_BR = {"b_eq", "b_ne", "b_hs", "b_lo"}
+_ARM_COND_BR = {"b_eq", "b_ne", "b_hs", "b_lo", "b_hi", "b_ls"}
 _ARM_FUSE_CMP = {"cmp_rr", "cmp_ri", "subs_rr", "subs_ri", "adds_rr", "adds_ri"}
 
 
@@ -329,6 +332,19 @@ def _uop_spec_for_row(row_name, cls, pipe):
         return [(pipe["store_ports"], 1.0)], 1.0, False, False, 1
     if cls in ("vec_alu", "vec_shift", "vec_shuf"):
         return [(pipe["fp_ports"], 1.0)], 2.0, True, False, 1
+    if cls == "vec_crypto":
+        # Empirically calibrated on Apple M6 (4.786 GHz):
+        # sha256h/h2: lat=4.00 cyc, rTP=2.00 cyc; sha256su0: lat=2.00 cyc, rTP=1.00 cyc (independent pipe);
+        # sha256su1: lat=3.00 cyc, rTP=1.00 cyc (independent pipe).
+        p0 = [pipe["fp_ports"][0]]
+        p1 = [pipe["fp_ports"][1]] if len(pipe["fp_ports"]) > 1 else p0
+        if row_name in ("sha256h", "sha256h2"):
+            return [(p0, 2.0)], 4.0, True, False, 1
+        if row_name == "sha256su0":
+            return [(p1, 1.0)], 2.0, True, False, 1
+        if row_name == "sha256su1":
+            return [(p1, 1.0)], 3.0, True, False, 1
+        return [(p0, 1.0)], 3.0, True, False, 1
     if cls in ("branch", "call", "ret"):
         return [(pipe["branch_ports"], 1.0)], 1.0, False, False, 1
     return [(pipe["alu_ports"], 1.0)], 1.0, False, False, 1
@@ -429,6 +445,7 @@ def simulate_loop(seq, arch_name, iterations=12, overrides=None):
             "groups": groups,
             "lat": lat,
             "is_fp": is_fp,
+            "is_mem": it["class"] in ("load", "store", "vec_load", "vec_store", "wide_load", "wide_store", "wide_bcast"),
             "is_elim": is_elim,
             "fe_uops": fe_uops,
             "is_branch": it["class"] == "branch",
@@ -466,13 +483,16 @@ def simulate_loop(seq, arch_name, iterations=12, overrides=None):
     retire_width = pipe["retire_width"]
     fp_sched = pipe["fp_sched_size"]
     int_sched = pipe["int_sched_size"]
+    agu_sched = pipe.get("agu_sched_size")
     fp_bypass = pipe.get("fp_cross_bypass", 0.0)
     branch_ends_fetch = pipe.get("branch_ends_fetch", False)
 
-    # Track dispatch cycle and completion cycle of every in-flight uop in the ROB (ring/deque).
+    # Track dispatch cycle and completion cycle of every in-flight uop in the ROB (in-order deque)
+    # and issue-completion cycle of uops occupying scheduler queues (out-of-order min-heaps!).
     rob_complete = collections.deque()   # completion cycle of each uop in program order
-    fp_inflight = collections.deque()    # execution-start cycle of in-flight FP uops (freed on issue)
-    int_inflight = collections.deque()
+    fp_inflight = []                     # min-heap of issue-free cycles for FP scheduler
+    int_inflight = []                    # min-heap of issue-free cycles for Int ALU scheduler
+    agu_inflight = []                    # min-heap of issue-free cycles for separate AGU scheduler (AMD Zen)
 
     disp_cyc = 0
     disp_used = 0
@@ -536,17 +556,22 @@ def simulate_loop(seq, arch_name, iterations=12, overrides=None):
                 advance_disp_cycle(need_cyc)
                 retire_up_to(disp_cyc)
 
-            # Scheduler queue back-pressure (split Int vs FP on Zen/Apple M; unified on Intel)
-            q_inflight = fp_inflight if (pipe["split_sched"] and op["is_fp"]) else int_inflight
-            q_cap = fp_sched if (pipe["split_sched"] and op["is_fp"]) else int_sched
+            # Scheduler queue back-pressure (split Int ALU / AGU / FP on Zen; split Int/FP on Apple M; unified on Intel).
+            # Out-of-order schedulers free entries as soon as any uop issues (min-heap, not FIFO!).
+            if pipe["split_sched"] and op["is_fp"]:
+                q_inflight, q_cap = fp_inflight, fp_sched
+            elif agu_sched is not None and op.get("is_mem"):
+                q_inflight, q_cap = agu_inflight, agu_sched
+            else:
+                q_inflight, q_cap = int_inflight, int_sched
             while q_inflight and q_inflight[0] <= disp_cyc:
-                q_inflight.popleft()
+                heapq.heappop(q_inflight)
             while len(q_inflight) + len(op["groups"]) > q_cap:
                 need_cyc = max(disp_cyc + 1, int(math.ceil(q_inflight[0])))
                 stall_sched += need_cyc - disp_cyc
                 advance_disp_cycle(need_cyc)
                 while q_inflight and q_inflight[0] <= disp_cyc:
-                    q_inflight.popleft()
+                    heapq.heappop(q_inflight)
 
             # Charge front-end & dispatch slots
             disp_used += u
@@ -604,7 +629,7 @@ def simulate_loop(seq, arch_name, iterations=12, overrides=None):
                         exec_start = float(st)
                     if st + op["lat"] > exec_done:
                         exec_done = st + op["lat"]
-                    q_inflight.append(float(st + 1))
+                    heapq.heappush(q_inflight, float(st + 1))
 
             for w in op["writes"]:
                 reg_ready[w] = exec_done
@@ -623,9 +648,17 @@ def simulate_loop(seq, arch_name, iterations=12, overrides=None):
         max_done = max((reg_ready[r] for r in reg_ready), default=float(disp_cyc))
         iter_exec_ends.append(max(float(disp_cyc), max_done))
 
-    # Measure steady-state throughput from the last half of iterations (after pipeline warm-up)
+    # Measure steady-state throughput from the last 6 iterations (LCM(2,3)=6 eliminates
+    # period-2 and period-3 aliasing from overlapping OOO iterations after warm-up).
     disp_rate = 0.0
-    if iterations >= 6:
+    if iterations >= 10:
+        win = 6
+        deltas = [iter_exec_ends[k] - iter_exec_ends[k - 1] for k in range(iterations - win, iterations)]
+        cyc_per_iter = sum(deltas) / len(deltas)
+        disp_deltas = [iter_disp_ends[k] - iter_disp_ends[k - 1] for k in range(iterations - win, iterations)]
+        disp_rate = sum(disp_deltas) / len(disp_deltas)
+        cyc_per_iter = max(cyc_per_iter, disp_rate)
+    elif iterations >= 6:
         deltas = [iter_exec_ends[k] - iter_exec_ends[k - 1] for k in range(iterations - 4, iterations)]
         cyc_per_iter = sum(deltas) / len(deltas)
         disp_deltas = [iter_disp_ends[k] - iter_disp_ends[k - 1] for k in range(iterations - 4, iterations)]
@@ -803,11 +836,11 @@ TARGET_ARCHS = {
 }
 
 
-def compare_all_archs(seq, target, line_map=None):
+def compare_all_archs(seq, target, line_map=None, iterations=12):
     """Run purely static pipeline analysis across all calibrated CPUs for `target` (<5 ms total)."""
     out = []
     for arch in TARGET_ARCHS.get(target, []):
-        sim = simulate_loop(seq, arch, iterations=12)
+        sim = simulate_loop(seq, arch, iterations=iterations)
         lints = static_lint_loop(seq, arch, line_map=line_map, sim_rep=sim)
         out.append({
             "arch": arch,
